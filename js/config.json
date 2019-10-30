@@ -1,0 +1,9 @@
+{
+    "win_com_port" : "COM3",
+    "xtal_freq_mhz" : 27.000225,
+  	"sweep_from_mhz":1,
+	"sweep_to_mhz":50,
+	"sweep_steps":100,
+	"sweep_step_time_ms":20,
+	"disable_freq_cache":true
+}

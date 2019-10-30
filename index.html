@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html>
+<head>
+
+
+	<link type="text/css" rel="stylesheet" href="media/style.css" />
+
+	<script type="text/javascript">
+
+	var config = require('./js/config.json');
+
+	var debug = false;
+	var visualize = true;
+	var gosweep = false;
+
+	var fs = require('fs');
+	var os = require('os');
+	var wstream;
+	var fp_opened = false;
+
+	var mytimer1;
+	var usbdev;
+
+	var sweep_from = config.sweep_from_mhz;
+	var sweep_to = config.sweep_to_mhz;
+	var sweep_steps = config.sweep_steps;
+	var sweep_step_time = config.sweep_step_time_ms; //ms
+
+	var disable_freq_cache = config.disable_freq_cache;
+
+	var SI_REGS = [9];
+
+	//var xtal = 27.0000;
+	xtal = config.xtal_freq_mhz;
+	
+	var pll = 30;
+	var fvco = xtal * pll;
+
+	var freq_cache = [];
+
+	var isWin = /^win/.test(process.platform);
+
+	function get_first_usb_device () {
+	
+		if (!isWin) {
+			//OS X & Linux
+			var dir_list = fs.readdirSync('/dev/');
+			var regex = /cu.usbmodem(.*)/;
+	
+			for (var i = 0, len = dir_list.length; i < len; i++) {
+				if (regex.test(dir_list[i])) {
+					//found one
+					var mydev = '/dev/'+dir_list[i];
+					console.log("Found USB device "+ mydev);
+					l_port_device.innerHTML = mydev;
+					usbdev = mydev;
+					return mydev;
+				}
+			}
+			
+			//not found
+			var msg = "Can't find Si5351 USB device!";
+			l_info2.innerHTML = msg + '<br />' + l_info2.innerHTML;
+			console.log(msg);
+			l_port_device.innerHTML = false;
+			usbdev = false;
+			return false;
+			
+		} else {
+			//Windows
+			usbdev = "\\\\.\\" + config.win_com_port;
+			return usbdev;
+		}
+	}
+
+
+	//default menu bar (about, edit, window)
+	var gui = require('nw.gui');
+	var win = gui.Window.get();
+	var nativeMenuBar = new gui.Menu({ type: "menubar" });
+	if (!isWin) nativeMenuBar.createMacBuiltin("Si5351 controller");
+	win.menu = nativeMenuBar;
+
+	//localStorage.love = "luyao"; //save
+	//console.log(localStorage.love); //read
+
+	/* Write serial data */
+
+	function port_open () {
+		/*
+		fs.open (usbdev, 'w', function (err, fd) {
+			filepointer = fd;
+			fp_opened = true;
+			console.log('File pointer opened');
+		});
+		*/
+		usbdev = get_first_usb_device();
+		
+		var options = { encoding: 'binary' };
+
+		if (usbdev) {
+			
+			//writer--------------
+			wstream = fs.createWriteStream(usbdev);
+			fp_opened = true;
+			console.log('File pointer opened');
+
+			var msg = '<span style="color:greenyellow">OPENED</span>';
+			l_info2.innerHTML = msg + '<br />' + l_info2.innerHTML;
+			if (visualize) l_port_status.innerHTML = msg;
+			
+			//error listener
+			wstream.on('error', function (err){ 
+				var msg = 'USB device connection broken! Try to reconnect device.';
+				l_info2.innerHTML = msg + '<br />' + l_info2.innerHTML;
+				if (visualize) l_port_status.innerHTML = '<span style="color:red">CLOSED</span>';
+				console.log(msg);
+				fp_opened = false;
+			})
+			
+		}
+	}
+
+	function port_close () {
+		/*
+		fs.close (filepointer, function (err, fd) {
+			console.log('File pointer closed');
+
+		});
+		*/
+		if (usbdev) {
+			wstream.end();
+		}
+		fp_opened = false;
+		console.log('File pointer closed');
+
+		var msg = '<span style="color:red">CLOSED</span>';
+		l_info2.innerHTML = msg + '<br />' + l_info2.innerHTML;
+		if (visualize) l_port_status.innerHTML = msg;
+	}
+
+	function write_serial (data) {
+
+		if (fp_opened) {
+			wstream.write(data);
+		} else {
+			console.log('File pointer not opened');
+		}
+
+		/*
+		//fs.open (usbdev, 'w', function (err, fd) {
+		if (fp_opened) {
+			fs.writeSync (filepointer, data, function (err) {
+				if (err) throw err;
+				//console.log(data);
+			});
+		} else {
+			console.log('File pointer not opened');
+		}
+		//});
+		*/
+	}
+
+
+
+	//Sweep function (callback by timer)
+	var sweep_curr_freq = sweep_from;
+	function sweep_cbfunc() {
+
+		var step_size = (sweep_to - sweep_from) / sweep_steps;
+
+		sweep_curr_freq += step_size;
+
+		if (sweep_curr_freq >= sweep_to) {
+			sweep_curr_freq = sweep_from;
+		}
+
+		//alert(parseFloat(sweep_curr_freq)+'|'+sweep_from+'|'+sweep_to+'|'+sweep_steps);
+
+		calc_freq(parseFloat(sweep_curr_freq));
+
+
+
+	}
+
+	function clear_logs() {
+		l_info2.innerHTML = '';
+	}
+
+	//--------------------------------------------------------
+	// Pretvori u zahtevan format za registre
+	//--------------------------------------------------------
+	function format_regs (cmd, out_a, out_b, out_c) {
+
+		var r = 1;
+		var p1 = 0;
+		var p2 = 0;
+		var p3 = 0;
+
+		//Si formula
+		p1 = 128 * out_a + Math.floor(128 * out_b / out_c) - 512;
+		p2 = 128 * out_b - out_c * Math.floor(128 * out_b / out_c);
+		p3 = out_c;
+
+		//--------------------------------------------------------
+		// Raspodeli vrednosti po registrima (MSOx ili PLLx)
+		//--------------------------------------------------------
+		SI_REGS[0] = cmd;
+		SI_REGS[1] = (p3 >> 8) & 0xFF;
+		SI_REGS[2] = (p3 >> 0) & 0xFF;
+		SI_REGS[3] = (parseInt(Math.log(r)) << 4 ) | (0 << 2) | ((p1 >> 16) & 0x3);
+		SI_REGS[4] = (p1 >> 8) & 0xFF;
+		SI_REGS[5] = (p1 >> 0) & 0xFF;
+		SI_REGS[6] = (((p3 >> 16) & 0xF) << 4) | (((p2 >> 16) & 0xF) << 0);
+		SI_REGS[7] = (p2 >> 8) & 0xFF;
+		SI_REGS[8] = (p2 >> 0) & 0xFF;
+
+		return SI_REGS;
+	}
+
+	//--------------------------------------------------------
+	// Izracunaj delitelje za trazenu frekvenciju
+	//--------------------------------------------------------
+	function calc_freq (fout) {
+
+			if (visualize) l_fout.innerHTML = fout.toFixed(7);
+			if (visualize) l_freq_div.innerHTML = fout.toFixed(7) + ' MHz';
+			if (visualize) l_freq_4x_label.innerHTML = (fout/4).toFixed(7);
+
+			//does we have cached freq?
+			if(typeof freq_cache[fout] == 'undefined' || disable_freq_cache == true) {
+
+				var REQ_DIV = fvco / fout;
+
+				if (debug)
+				console.log("REQ_DIV=", REQ_DIV);
+
+				//racun - aproksimacija
+				var cnt = 0;
+				var a = 0;
+				var b = 1;
+				var c = 1;
+				var d = 1;
+				var N = 100000; //denominator
+				var loop_break = false;
+				var median = 0;
+				var out_a = 0;
+				var out_b = 0;
+				var out_c = 0;
+
+				var x = REQ_DIV - parseInt(REQ_DIV); //uzmi samo vrednost iza zareza
+
+
+				while (b <= N && d <= N) {
+
+		            cnt++;
+
+		            mediant = (a+c)/(b+d);
+		            if (x == mediant) {
+		                if (b + d <= N) {
+		                    out_b = a+c;
+		                    out_c = b+d;
+		                    loop_break = true;
+		                    break;
+		                } else if (d > b) {
+		                    out_b = c;
+		                    out_c = d;
+		                    loop_break = true;
+		                    break;
+		                } else {
+		                    out_b = a;
+		                    out_c = b;
+		                    loop_break = true;
+		                    break;
+		                }
+		            } else if (x > mediant) {
+		                a = a+c;
+		                b = b+d;
+		            } else {
+		                c = a+c;
+		                d = b+d;
+		            }
+		        }
+
+		        if (loop_break == false) {
+		            if (b > N) {
+		                out_b = c;
+		                out_c = d;
+		            } else {
+		                out_b = a;
+		                out_c = b;
+		            }
+		        }
+
+				out_a = parseInt(REQ_DIV);
+
+				//format registers
+				var SI_REGS = format_regs (0x77, out_a, out_b, out_c);
+
+				//put results into cache
+				if (!disable_freq_cache) freq_cache[fout] = [out_a, out_b, out_c, REQ_DIV, SI_REGS];
+			} else {
+
+				//pull cached results
+				out_a = freq_cache[fout][0];
+				out_b = freq_cache[fout][1];
+				out_c = freq_cache[fout][2];
+				REQ_DIV = freq_cache[fout][3];
+				SI_REGS = freq_cache[fout][4];
+
+				cnt = 1;
+
+			}
+
+			if (debug)
+	        console.log("REQ_DIV=", REQ_DIV, 'a/b/c/cnt=', out_a, out_b, out_c, cnt);
+
+			if (visualize) {
+				if ((REQ_DIV==4 || REQ_DIV==6 || REQ_DIV==8) || (REQ_DIV>8 && REQ_DIV<900)) {	//4,6,8,900
+					l_mso1_div.innerHTML = '<span style="color:white">'+REQ_DIV.toFixed(8)+'</span>';
+				} else {
+					l_mso1_div.innerHTML = '<span style="color:red">'+REQ_DIV.toFixed(8)+'</span>';
+				}
+			}
+
+			if (visualize) l_fvco.innerHTML = (fvco).toFixed(7);
+			if (visualize) l_fxtal.innerHTML = xtal;
+			if (visualize) l_siregs.innerHTML = SI_REGS;
+			if (visualize) l_mso1_1.innerHTML = out_a;
+			if (visualize) l_mso1_2.innerHTML = out_b;
+			if (visualize) l_mso1_3.innerHTML = out_c;
+			if (visualize) l_mso1_cnt.innerHTML = cnt;
+
+			if (debug)
+			console.log("SI_REGS=",SI_REGS[0], SI_REGS[1], SI_REGS[2], SI_REGS[3],SI_REGS[4], SI_REGS[5], SI_REGS[6], SI_REGS[7], SI_REGS[8]);
+			
+			//write now!
+			var buf = new Buffer(SI_REGS);
+			write_serial(buf);
+
+	}
+
+	function set_single_reg() {
+		var reg_val = parseInt(document.getElementById('si_reg_val').value);
+		var reg_adr = document.getElementById('si_reg_adr').value;
+		
+		if (reg_val < 0 || reg_val > 255) {
+			alert ("Error: Register value must be in range 0 - 255");
+			return 0;
+		}
+		
+		if (isNaN(reg_val)) reg_val = 0;
+		
+		msg = "Setting register " + reg_adr + "=" + reg_val;
+		l_info2.innerHTML = msg + '<br />' + l_info2.innerHTML;
+		
+		//write now!
+		SI_REGS[0] = 0x73;
+		SI_REGS[1] = reg_adr;
+		SI_REGS[2] = reg_val;
+		var buf = new Buffer(SI_REGS);
+		write_serial(buf);
+		
+	}
+
+	</script>
+</head>
+
+<body onload='init()'>
+
+<script type="text/javascript">
+	var bar, slider;
+
+	function init(){
+
+		//labels (od modlica)
+		l_info2 = document.getElementById('info2');
+		l_port_status = document.getElementById('port_status');
+		l_port_device = document.getElementById('port_device');
+		l_fout = document.getElementById('fout');
+		l_freq_div = document.getElementById('freq_div');
+		l_freq_4x_label = document.getElementById('freq_4x_label');
+		l_mso1_div = document.getElementById('mso1_div');
+		l_fvco = document.getElementById('fvco');
+		l_fxtal = document.getElementById('fxtal');
+		l_siregs = document.getElementById('siregs');
+		l_mso1_1 = document.getElementById('mso1_1');
+		l_mso1_2 = document.getElementById('mso1_2');
+		l_mso1_3 = document.getElementById('mso1_3');
+		l_mso1_cnt = document.getElementById('mso1_cnt');
+		
+		l_pll1_d = document.getElementById('pll1_div');
+		l_pll1_d.innerHTML=pll.toFixed(8);
+		l_pll1_1 = document.getElementById('pll1_1');
+		l_pll1_1.innerHTML=pll;
+		
+
+		//var usbdev = get_first_usb_device();
+
+		port_open ();
+
+		bar = document.getElementById('bar');
+		slider = document.getElementById('slider');
+
+		bar.addEventListener('mousedown', startSlide, false);
+		bar.addEventListener('mouseup', stopSlide, false);
+		
+		
+	}
+
+	function viz_change (el) {
+		if (el.checked) {
+			visualize = true;
+		} else {
+			visualize = false;
+		}
+	}
+
+	function sweep_start_stop (el) {
+		if (el.checked) {
+			mytimer1 = setInterval(sweep_cbfunc, sweep_step_time);
+			msg = 'Running sweep '+sweep_from+'MHz - '+sweep_to+'MHz with '+sweep_steps+' steps ...';
+			l_info2.innerHTML = msg + '<br />' + l_info2.innerHTML;
+		} else {
+			msg = 'Sweep stopped';
+			l_info2.innerHTML = msg + '<br />' + l_info2.innerHTML;
+			window.clearInterval(mytimer1);
+		}
+	}
+
+	function enter_freq (divide4) {
+		var inputFreq = document.getElementById('man_freq_input').value;
+		if (divide4) {
+			//with divider
+			//var inputFreq = prompt("Enter frequency /4 in MHz (for SDR)");
+			if (inputFreq) calc_freq(parseFloat(inputFreq * 4));
+		} else {
+			//direct frequency entry
+			//var inputFreq = prompt("Enter frequency in MHz");
+			if (inputFreq) calc_freq(parseFloat(inputFreq));
+		}
+	}
+
+	function sweep_set_from () {
+	    var sfrom = prompt("Enter sweep starting frequency in MHz", sweep_from);
+	    if (sfrom != null) {
+			sweep_from = parseFloat(sfrom);
+			sweep_curr_freq = parseFloat(sfrom); //update current freq
+			document.getElementById('sweep_val_from').innerHTML = sfrom;
+	    }
+	}
+
+	function sweep_set_to () {
+	    var sto = prompt("Enter sweep stop frequency in MHz", sweep_to);
+	    if (sto != null) {
+			sweep_to = sto;
+			document.getElementById('sweep_val_to').innerHTML = sto;
+	    }
+	}
+
+	function sweep_set_steps() {
+	    var ss = prompt("Enter sweep steps", sweep_steps);
+	    if (ss != null) {
+			sweep_steps = ss;
+			document.getElementById('sweep_val_steps').innerHTML = ss;
+	    }
+	}
+
+	function startSlide(event){
+		var set_perc = ((((event.clientX - bar.offsetLeft) / bar.offsetWidth)).toFixed(3));
+		//info.innerHTML = 'start' + set_perc + '%';
+		bar.addEventListener('mousemove', moveSlide, false);
+		slider.style.width = (set_perc * 100) + '%';
+	}
+
+	function moveSlide(event){
+		var set_perc = ((((event.clientX - bar.offsetLeft) / bar.offsetWidth)).toFixed(3));
+		//info.innerHTML = 'moving : ' + set_perc + '%';
+		slider.style.width = (set_perc * 100) + '%';
+		calc_freq((sweep_to - sweep_from) * set_perc + sweep_from);
+	}
+
+	function stopSlide(event){
+		var set_perc = ((((event.clientX - bar.offsetLeft) / bar.offsetWidth)).toFixed(3));
+		//info.innerHTML = 'done : ' + set_perc + '%';
+		bar.removeEventListener('mousemove', moveSlide, false);
+		slider.style.width = (set_perc * 100) + '%';
+	}
+
+</script>
+
+	<div id="freq_div" class="freq_div">0.00</div>
+
+	<div id="sc"></div>
+
+	<div id='bar' style="noselect">
+		<div id='slider' style="noselect">
+
+		</div>
+	</div>
+
+ 	<!-- <div id='info'>info</div> -->
+ 	<div id='info2'></div>
+
+ 	<button onclick="calc_freq(3.5*4)">3.5MHz</button>
+ 	<button onclick="calc_freq(3.7*4);">3.7MHz</button>
+ 	<button onclick="calc_freq(3.8*4);">3.8MHz</button>
+ 	<button onclick="calc_freq(10*4);">10MHz</button>
+ 	<button onclick="calc_freq(14*4);">14MHz</button>
+ 	<button onclick="calc_freq(18*4);">18MHz</button>
+ 	<button onclick="calc_freq(21*4);">21MHz</button>
+
+	<hr />
+
+ 	<button onclick="port_open();" title="Open port">Open</button>
+ 	<button onclick="port_close();" title="Close port">Close</button>
+ 	<button onclick="write_serial('0');">M0</button>
+ 	<button onclick="write_serial('1');">M1</button>
+ 	<button onclick="write_serial('2');">M2</button>
+ 	<button onclick="write_serial('3');">M3</button>
+ 	<button onclick="calc_freq(27);" title="Set 27MHz without ppm corection">UNCAL</button>
+ 	<button onclick="calc_freq(27);" title="Set 27MHz with ppm corection">CAL</button>
+ 	<button onclick="clear_logs();" title="Clear logs">Clear</button>
+	<hr />
+
+	
+	<input type="text" name="man_freq_input" id="man_freq_input" maxlength="9" title="Enter frequency in MHz" style="width:65px" value="1"/>
+ 	<button onclick="enter_freq();">Enter F</button>
+ 	<button onclick="enter_freq(true);">Enter F/4</button>
+	
+	<select name="si_reg_adr" id="si_reg_adr" title="Si5351 register address">
+		<option value="0">0x00 - 0</option>
+		<option value="1">0x01 - 1</option>
+		<option value="2">0x02 - 2</option>
+		<option value="3">0x03 - 3</option>
+		<option value="24">0x18 - 24</option>
+		<option value="177">0xB1 - 177</option>
+		<option value="183">0xB7 - 183</option>
+	</select>
+	
+	<input type="text" name="si_reg_val" id="si_reg_val" maxlength="3" title="Si5351 register value as decimal number" style="width:50px" value="0"/>
+	
+	<button onclick="set_single_reg()">Set</button>
+	<button onclick="" disabled="disabled" >Get</button>
+	
+	<hr />
+
+	<div class="modla"><span class="dlabel">Fout MHz</span><div id="fout">14.8</div></div>
+	<div class="modla"><span class="dlabel">Fvco MHz</span><div id="fvco">800</div></div>
+	<div class="modla"><span class="dlabel">Xtal MHz</span><div id="fxtal">27.000180</div></div>
+	<div class="modla" style="width:180px"><span class="dlabel">SI REGS</span><div id="siregs">ss</div></div>
+	<br />
+	<div class="modla"><span class="dlabel" title="Valid Multisynth divider ratios are 4, 6, 8, and any fractional value between 8 + 1/1,048,575 and 900 + 0/1.">MSO1 ratio</span><div id="mso1_div">1</div></div>
+	<div class="modla"><span class="dlabel">MSO1 A</span><div id="mso1_1">1</div></div>
+	<div class="modla"><span class="dlabel">MSO1 B</span><div id="mso1_2">1</div></div>
+	<div class="modla"><span class="dlabel">MSO1 C</span><div id="mso1_3">1</div></div>
+	<div class="modla"><span class="dlabel">MSO1 cnt</span><div id="mso1_cnt">1</div></div>
+	<br />
+	<div class="modla"><span class="dlabel" title="PLL divider ratios has a valid range of 15 + 0/1,048,575 and 90 +0/1,048,575">PLL1 RATIO</span><div id="pll1_div">30.0000000</div></div>
+	<div class="modla"><span class="dlabel">PLL1 A</span><div id="pll1_1">30</div></div>
+	<div class="modla"><span class="dlabel">PLL1 B</span><div id="pll1_2">0</div></div>
+	<div class="modla"><span class="dlabel">PLL1 C</span><div id="pll1_3">1</div></div>
+	<br />
+	<div class="modla"><span class="dlabel">USB Status</span><div id="port_status">CLOSED</div></div>
+	<div class="modla" style="width:180px"><span class="dlabel">USB DEVICE</span><div id="port_device">/dev/cu.usbmodem411</div></div>
+	<div class="modla"><span class="dlabel">Debug</span><br /><input type="checkbox" value="1" id="viz_status" checked="checked" onchange="viz_change(this)" /></div>
+	<br />
+	<div class="modla" ondblclick="sweep_set_from()"><span class="dlabel">Sweep from</span><div id="sweep_val_from">1</div></div>
+	<div class="modla" ondblclick="sweep_set_to()"><span class="dlabel">Sweep to MHZ</span><div id="sweep_val_to">50</div></div>
+	<div class="modla" ondblclick="sweep_set_steps()"><span class="dlabel">Sweep steps</span><div id="sweep_val_steps">100</div></div>
+	<div class="modla"><span class="dlabel">RUN Sweep</span><br /><input type="checkbox" value="1" id="sweep_status" onchange="sweep_start_stop(this)" /></div>
+	<br />
+	<div class="modla"><span class="dlabel">SDR FREQ /4x</span><div id="freq_4x_label">1</div></div>
+</body>
+</html>

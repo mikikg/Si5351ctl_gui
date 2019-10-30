@@ -1,0 +1,28 @@
+{
+  "name": "Si5351_Controller",
+  "version": "0.0.2",
+  "description": "Si5351 USB controller by YU3MA V0.2b",
+  "main": "index.html",
+  "window": {
+    "title": "Si5351 USB controller by YU3MA V0.2b",
+    "toolbar": false,
+    "resizable": true,
+    "width": 510,
+    "height": 515,
+    "min_width": 400,
+    "min_height": 200,
+    "max_width": 1200,
+    "max_height": 800,
+    "position": "mouse"
+  },
+  "webkit": {
+    "plugin": false,
+    "java": false,
+    "page-cache": false
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "A. Markovic YU3MA",
+  "license": "CC"
+}
